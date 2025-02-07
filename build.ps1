@@ -1,9 +1,7 @@
 #!/usr/bin/env pwsh
 
-# 设置错误时停止执行
 $ErrorActionPreference = "Stop"
 
-# 定义颜色输出函数
 function Write-ColorOutput($ForegroundColor) {
     $fc = $host.UI.RawUI.ForegroundColor
     $host.UI.RawUI.ForegroundColor = $ForegroundColor
@@ -13,11 +11,9 @@ function Write-ColorOutput($ForegroundColor) {
     $host.UI.RawUI.ForegroundColor = $fc
 }
 
-# 获取项目根目录
 $projectRoot = $PSScriptRoot
 $outputDir = Join-Path $projectRoot "output"
 
-# 创建输出目录结构
 Write-ColorOutput Green "Creating output directories..."
 $platforms = @(
     "windows_amd64",
@@ -31,7 +27,6 @@ foreach ($platform in $platforms) {
     $null = New-Item -ItemType Directory -Force -Path (Join-Path $outputDir $platform)
 }
 
-# 编译函数
 function Build-Binary {
     param (
         [string]$os,
@@ -57,7 +52,6 @@ function Build-Binary {
     }
 }
 
-# 开始编译
 Write-ColorOutput Green "Starting build process..."
 $buildTime = Get-Date
 $builtFiles = @()
@@ -68,7 +62,6 @@ foreach ($platform in $platforms) {
     $builtFiles += Build-Binary -os $os -arch $arch -component "kankanc"
 }
 
-# 输出结果
 Write-ColorOutput Green "`nBuild completed successfully at $buildTime"
 Write-ColorOutput Yellow "`nBuilt files:"
 foreach ($file in $builtFiles) {

@@ -1,25 +1,27 @@
-# Binaries
+/kankans
+/kankans.exe
+/kankanc
+/kankanc.exe
+
+!/kankans/
+!/kankanc/
+
+/output/
+/bin/
+/dist/
+
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-kankans
-kankanc
-
-# Test binary, built with `go test -c`
 *.test
-
-# Output of the go coverage tool
 *.out
 
-# Dependency directories
 vendor/
 
-# Go workspace file
 go.work
 
-# IDE specific files
 .idea/
 .vscode/
 *.swp
@@ -27,9 +29,7 @@ go.work
 *.swn
 .DS_Store
 
-# Log files
 *.log
 
-# Environment variables
 .env
 *.env.local
