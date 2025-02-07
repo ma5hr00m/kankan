@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -14,17 +15,19 @@ import (
 )
 
 type Config struct {
-	BindAddr            string
-	BindPort            int
-	Key                 string
-	ProxyPort           int
-	MaxConnections      int
-	ConnTimeout         time.Duration
-	HeartbeatInterval   time.Duration
-	BufferSize          int
-	CleanupInterval     time.Duration
-	LogLevel            string
-	IdleTimeout         time.Duration
+	BindAddr          string
+	BindPort          int
+	Key               string
+	ProxyPort         int
+	MaxConnections    int
+	ConnTimeout       time.Duration
+	HeartbeatInterval time.Duration
+	BufferSize        int
+	CleanupInterval   time.Duration
+	LogLevel          string
+	IdleTimeout       time.Duration
+	EnableUDP         bool
+	UDPBufferSize     int
 }
 
 var config Config
@@ -41,11 +44,13 @@ func init() {
 	flag.DurationVar(&config.CleanupInterval, "cleanup", 60*time.Second, "Cleanup interval")
 	flag.StringVar(&config.LogLevel, "log-level", "info", "Log level (debug/info/warn/error)")
 	flag.DurationVar(&config.IdleTimeout, "idle-timeout", 300*time.Second, "Idle connection timeout")
+	flag.BoolVar(&config.EnableUDP, "enable-udp", false, "Enable UDP proxy support")
+	flag.IntVar(&config.UDPBufferSize, "udp-buffer", 65507, "UDP buffer size (bytes)")
 }
 
 func main() {
 	flag.Parse()
-	
+
 	if config.Key == "" {
 		log.Fatal("[ERR] Encryption key is required")
 	}
@@ -63,19 +68,111 @@ type Client struct {
 }
 
 type Server struct {
-	config         Config
-	listener       net.Listener
-	proxy          net.Listener
-	clients        map[string]*Client
-	mu             sync.RWMutex
-	activeConns    int32
+	config      Config
+	listener    net.Listener
+	proxy       net.Listener
+	udpProxy    *net.UDPConn
+	clients     map[string]*Client
+	udpSessions map[string]*UDPSession
+	mu          sync.RWMutex
+	activeConns int32
+	workerPool  *WorkerPool
+	bufferPool  sync.Pool
+	metrics     *Metrics
+}
+
+type WorkerPool struct {
+	workers chan struct{}
+}
+
+func NewWorkerPool(size int) *WorkerPool {
+	return &WorkerPool{
+		workers: make(chan struct{}, size),
+	}
+}
+
+func (p *WorkerPool) Submit(task func()) {
+	p.workers <- struct{}{}
+	go func() {
+		defer func() { <-p.workers }()
+		task()
+	}()
+}
+
+type UDPSession struct {
+	clientAddr *net.UDPAddr
+	localConn  *net.UDPConn
+	lastSeen   time.Time
+	crypto     *crypto.Crypto
+}
+
+type Metrics struct {
+	activeConnections int32
+	totalConnections  uint64
+	totalBytes        uint64
+	totalPackets      uint64
+	totalErrors       uint64
+	lastMinuteBytes   uint64
+	lastMinutePackets uint64
+	lastUpdateTime    time.Time
+	mu                sync.RWMutex
+}
+
+func (m *Metrics) recordBytes(n int) {
+	atomic.AddUint64(&m.totalBytes, uint64(n))
+	atomic.AddUint64(&m.lastMinuteBytes, uint64(n))
+}
+
+func (m *Metrics) recordPacket() {
+	atomic.AddUint64(&m.totalPackets, 1)
+	atomic.AddUint64(&m.lastMinutePackets, 1)
+}
+
+func (m *Metrics) recordError() {
+	atomic.AddUint64(&m.totalErrors, 1)
+}
+
+func (m *Metrics) updateStats() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	if now.Sub(m.lastUpdateTime) >= time.Minute {
+		atomic.StoreUint64(&m.lastMinuteBytes, 0)
+		atomic.StoreUint64(&m.lastMinutePackets, 0)
+		m.lastUpdateTime = now
+	}
 }
 
 func NewServer(config Config) *Server {
 	return &Server{
 		config:      config,
 		clients:     make(map[string]*Client),
+		udpSessions: make(map[string]*UDPSession),
 		activeConns: 0,
+		workerPool:  NewWorkerPool(config.MaxConnections),
+		bufferPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, config.BufferSize)
+			},
+		},
+		metrics: &Metrics{
+			lastUpdateTime: time.Now(),
+		},
+	}
+}
+
+func (s *Server) getBuf(size int) []byte {
+	buf := s.bufferPool.Get().([]byte)
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func (s *Server) putBuf(buf []byte) {
+	if cap(buf) <= s.config.BufferSize {
+		s.bufferPool.Put(buf[:0])
 	}
 }
 
@@ -92,26 +189,41 @@ func (s *Server) Start() error {
 	}
 
 	if err := s.startControlServer(); err != nil {
-		return fmt.Errorf("[ERR] Failed to start control server: %w", err)
+		return fmt.Errorf("failed to start control server: %w", err)
 	}
 
 	if err := s.startProxyServer(); err != nil {
-		return fmt.Errorf("[ERR] Failed to start proxy server: %w", err)
+		return fmt.Errorf("failed to start proxy server: %w", err)
+	}
+
+	if s.config.EnableUDP {
+		if err := s.startUDPProxy(); err != nil {
+			return fmt.Errorf("failed to start UDP proxy: %w", err)
+		}
 	}
 
 	go s.cleanInactiveClients()
-	
-	log.Printf("[INFO] Server started successfully on %s:%d (control) and :%d (proxy)",
-		s.config.BindAddr, s.config.BindPort, s.config.ProxyPort)
-	
-	select {}
+	go s.updateMetrics()
+
+	return nil
+}
+
+func (s *Server) updateMetrics() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.metrics.updateStats()
+		activeConns := atomic.LoadInt32(&s.activeConns)
+		atomic.StoreInt32(&s.metrics.activeConnections, activeConns)
+	}
 }
 
 func (s *Server) startControlServer() error {
 	addr := fmt.Sprintf("%s:%d", s.config.BindAddr, s.config.BindPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("[ERR] Failed to start control server: %w", err)
+		return fmt.Errorf("failed to start control server: %w", err)
 	}
 	s.listener = listener
 
@@ -125,13 +237,30 @@ func (s *Server) startProxyServer() error {
 	addr := fmt.Sprintf("%s:%d", s.config.BindAddr, s.config.ProxyPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("[ERR] Failed to start proxy server: %w", err)
+		return fmt.Errorf("failed to start proxy server: %w", err)
 	}
 	s.proxy = listener
 
 	log.Printf("[INFO] Proxy server listening on %s\n", addr)
 
 	go s.acceptProxyConnections()
+	return nil
+}
+
+func (s *Server) startUDPProxy() error {
+	addr := fmt.Sprintf("%s:%d", s.config.BindAddr, s.config.ProxyPort)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+
+	s.udpProxy, err = net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+
+	go s.handleUDPProxy()
+	log.Printf("[INFO] UDP proxy listening on %s\n", addr)
 	return nil
 }
 
@@ -161,158 +290,270 @@ func (s *Server) acceptProxyConnections() {
 
 func (s *Server) handleControlConnection(conn net.Conn) {
 	defer conn.Close()
-	
-	if atomic.LoadInt32(&s.activeConns) >= int32(s.config.MaxConnections) {
-		log.Printf("[ERR] Maximum connections reached: %d", s.config.MaxConnections)
-		return
-	}
-	
-	atomic.AddInt32(&s.activeConns, 1)
 	defer atomic.AddInt32(&s.activeConns, -1)
 
-	conn.SetDeadline(time.Now().Add(s.config.ConnTimeout))
-	
-	crypto, err := crypto.NewCrypto(s.config.Key)
+	clientAddr := conn.RemoteAddr().String()
+	log.Printf("[INFO] New control connection from %s\n", clientAddr)
+
+	msg, err := protocol.ReadMessage(conn)
 	if err != nil {
-		log.Printf("[ERR] Failed to create crypto instance: %v\n", err)
+		log.Printf("[ERR] Failed to read auth message: %v\n", err)
 		return
 	}
+	defer protocol.ReleaseMessage(msg)
+
+	if msg.Type != protocol.MsgTypeAuth {
+		log.Printf("[ERR] First message must be auth\n")
+		return
+	}
+
+	crypto, err := crypto.NewCrypto(s.config.Key)
+	if err != nil {
+		log.Printf("[ERR] Failed to create crypto: %v\n", err)
+		return
+	}
+
 	client := &Client{
 		conn:     conn,
 		crypto:   crypto,
 		lastSeen: time.Now(),
 	}
 
-	msg, err := protocol.ReadMessage(conn)
-	if err != nil {
-		log.Printf("[ERR] Failed to read authentication message: %v\n", err)
-		return
-	}
-
-	if msg.Type != protocol.MsgTypeAuth {
-		log.Printf("[ERR] Unexpected message type: %d", msg.Type)
-		return
-	}
-
-	clientAddr := conn.RemoteAddr().String()
 	s.mu.Lock()
 	s.clients[clientAddr] = client
 	s.mu.Unlock()
 
-	log.Printf("[INFO] Client authenticated: %s\n", clientAddr)
+	defer func() {
+		s.mu.Lock()
+		delete(s.clients, clientAddr)
+		s.mu.Unlock()
+	}()
 
 	for {
 		msg, err := protocol.ReadMessage(conn)
 		if err != nil {
-			break
-		}
-
-		switch msg.Type {
-		case protocol.MsgTypeHeartbeat:
-			s.mu.Lock()
-			if client, ok := s.clients[clientAddr]; ok {
-				client.lastSeen = time.Now()
+			if err != io.EOF {
+				log.Printf("[ERR] Failed to read message: %v\n", err)
 			}
-			s.mu.Unlock()
-		case protocol.MsgTypeData:
-			s.handleClientData(clientAddr, msg)
+			return
 		}
-	}
 
-	s.mu.Lock()
-	delete(s.clients, clientAddr)
-	s.mu.Unlock()
-	log.Printf("[INFO] Client disconnected: %s\n", clientAddr)
+		s.workerPool.Submit(func() {
+			defer protocol.ReleaseMessage(msg)
+			if err := s.handleClientData(clientAddr, msg); err != nil {
+				log.Printf("[ERR] Failed to handle client data: %v\n", err)
+			}
+		})
+
+		client.lastSeen = time.Now()
+	}
 }
 
 func (s *Server) handleProxyConnection(conn net.Conn) {
 	defer conn.Close()
+	defer atomic.AddInt32(&s.activeConns, -1)
 
+	clientAddr := conn.RemoteAddr().String()
 	s.mu.RLock()
-	if len(s.clients) == 0 {
-		s.mu.RUnlock()
-		log.Printf("[ERR] No available clients\n")
-		return
-	}
-
-	var client *Client
-	for _, c := range s.clients {
-		client = c
-		break
-	}
+	client, exists := s.clients[clientAddr]
 	s.mu.RUnlock()
 
-	msg := &protocol.Message{
-		Type: protocol.MsgTypeNewProxy,
-	}
-	if err := protocol.WriteMessage(client.conn, msg); err != nil {
-		log.Printf("[ERR] Failed to notify client of new proxy connection: %v\n", err)
+	if !exists {
+		log.Printf("[ERR] Unknown client %s\n", clientAddr)
 		return
 	}
 
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				return
-			}
+	localAddr := fmt.Sprintf("%s:%d", s.config.BindAddr, 0)
+	local, err := net.Dial("tcp", localAddr)
+	if err != nil {
+		log.Printf("[ERR] Failed to connect to local service: %v\n", err)
+		return
+	}
+	defer local.Close()
 
-			data, err := client.crypto.Encrypt(buf[:n])
-			if err != nil {
-				log.Printf("[ERR] Failed to encrypt data: %v\n", err)
-				return
-			}
+	errChan := make(chan error, 2)
 
-			msg := &protocol.Message{
-				Type:    protocol.MsgTypeData,
-				Length:  uint32(len(data)),
-				Payload: data,
-			}
-			if err := protocol.WriteMessage(client.conn, msg); err != nil {
-				return
-			}
-		}
-	}()
+	s.workerPool.Submit(func() {
+		errChan <- s.proxyData(local, conn, client)
+	})
+
+	s.workerPool.Submit(func() {
+		errChan <- s.proxyData(conn, local, client)
+	})
+
+	<-errChan
+}
+
+func (s *Server) proxyData(dst net.Conn, src net.Conn, client *Client) error {
+	buf := s.getBuf(s.config.BufferSize)
+	defer s.putBuf(buf)
 
 	for {
-		msg, err := protocol.ReadMessage(client.conn)
+		n, err := src.Read(buf)
 		if err != nil {
-			return
+			s.metrics.recordError()
+			return err
 		}
 
-		if msg.Type != protocol.MsgTypeData {
-			continue
+		data := buf[:n]
+		s.metrics.recordBytes(n)
+		s.metrics.recordPacket()
+
+		if src == client.conn {
+			data, err = client.crypto.Decrypt(data)
+			if err != nil {
+				s.metrics.recordError()
+				return err
+			}
+		} else {
+			data, err = client.crypto.Encrypt(data)
+			if err != nil {
+				s.metrics.recordError()
+				return err
+			}
 		}
 
-		data, err := client.crypto.Decrypt(msg.Payload)
-		if err != nil {
-			log.Printf("[ERR] Failed to decrypt data: %v\n", err)
-			return
-		}
-
-		if _, err := conn.Write(data); err != nil {
-			return
+		if _, err := dst.Write(data); err != nil {
+			s.metrics.recordError()
+			return err
 		}
 	}
 }
 
-func (s *Server) handleClientData(clientAddr string, msg *protocol.Message) {
+func (s *Server) handleUDPProxy() {
+	buffer := s.getBuf(s.config.UDPBufferSize)
+	defer s.putBuf(buffer)
+
+	for {
+		n, remoteAddr, err := s.udpProxy.ReadFromUDP(buffer)
+		if err != nil {
+			log.Printf("[ERR] Failed to read UDP data: %v\n", err)
+			continue
+		}
+
+		data := buffer[:n]
+		s.workerPool.Submit(func() {
+			s.handleUDPData(remoteAddr, data)
+		})
+	}
+}
+
+func (s *Server) handleUDPData(remoteAddr *net.UDPAddr, data []byte) {
 	s.mu.RLock()
-	client, ok := s.clients[clientAddr]
+	session, exists := s.udpSessions[remoteAddr.String()]
 	s.mu.RUnlock()
 
-	if !ok {
+	if !exists {
 		return
 	}
 
-	data, err := client.crypto.Decrypt(msg.Payload)
+	session.lastSeen = time.Now()
+	s.metrics.recordBytes(len(data))
+	s.metrics.recordPacket()
+
+	decrypted, err := session.crypto.Decrypt(data)
 	if err != nil {
-		log.Printf("[ERR] Failed to decrypt data: %v\n", err)
+		s.metrics.recordError()
+		log.Printf("[ERR] Failed to decrypt UDP data: %v\n", err)
 		return
 	}
 
-	log.Printf("[INFO] Received data from %s: %d bytes\n", clientAddr, len(data))
+	if _, err := session.localConn.Write(decrypted); err != nil {
+		s.metrics.recordError()
+		log.Printf("[ERR] Failed to write UDP data to local connection: %v\n", err)
+	}
+}
+
+func (s *Server) handleClientData(clientAddr string, msg *protocol.Message) error {
+	switch msg.Type {
+	case protocol.MsgTypeHeartbeat:
+		return nil
+	case protocol.MsgTypeNewProxy:
+		s.mu.RLock()
+		client, exists := s.clients[clientAddr]
+		s.mu.RUnlock()
+
+		if !exists {
+			return fmt.Errorf("client not found")
+		}
+
+		if len(msg.Payload) < 1 {
+			return fmt.Errorf("invalid proxy request")
+		}
+
+		proxyType := msg.Payload[0]
+		if proxyType == protocol.ProxyTypeUDP && s.config.EnableUDP {
+			return s.handleUDPProxyRequest(clientAddr, client)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown message type")
+	}
+}
+
+func (s *Server) handleUDPProxyRequest(clientAddr string, client *Client) error {
+	localAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", s.config.BindAddr, 0))
+	if err != nil {
+		return err
+	}
+
+	localConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		return err
+	}
+
+	remoteAddr, err := net.ResolveUDPAddr("udp", clientAddr)
+	if err != nil {
+		return err
+	}
+
+	session := &UDPSession{
+		clientAddr: remoteAddr,
+		localConn:  localConn,
+		lastSeen:   time.Now(),
+		crypto:     client.crypto, // 使用客户端的加密实例
+	}
+
+	s.mu.Lock()
+	s.udpSessions[clientAddr] = session
+	s.mu.Unlock()
+
+	go s.handleUDPSession(session)
+	return nil
+}
+
+func (s *Server) handleUDPSession(session *UDPSession) {
+	buffer := s.getBuf(s.config.UDPBufferSize)
+	defer s.putBuf(buffer)
+
+	for {
+		n, _, err := session.localConn.ReadFromUDP(buffer)
+		if err != nil {
+			log.Printf("[ERR] Failed to read from UDP session: %v\n", err)
+			break
+		}
+
+		session.lastSeen = time.Now()
+
+		// 加密发送到客户端的数据
+		encrypted, err := session.crypto.Encrypt(buffer[:n])
+		if err != nil {
+			s.metrics.recordError()
+			log.Printf("[ERR] Failed to encrypt UDP data: %v\n", err)
+			break
+		}
+
+		if _, err := s.udpProxy.WriteToUDP(encrypted, session.clientAddr); err != nil {
+			s.metrics.recordError()
+			log.Printf("[ERR] Failed to write to UDP proxy: %v\n", err)
+			break
+		}
+	}
+
+	s.mu.Lock()
+	delete(s.udpSessions, session.clientAddr.String())
+	s.mu.Unlock()
+	session.localConn.Close()
 }
 
 func (s *Server) cleanInactiveClients() {

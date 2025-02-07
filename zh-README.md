@@ -14,31 +14,54 @@ Kankan 是一个使用 Go 语言编写的轻量级安全内网穿透工具。
 kankans.exe -bind 0.0.0.0 -port 8080 -proxy 8081 -key your-secret-key
 
 # 高级配置
-kankans.exe \
-  -bind 0.0.0.0 \
-  -port 8080 \
-  -proxy 8081 \
-  -key your-secret-key \
-  -max-conn 100 \
-  -timeout 30s \
-  -heartbeat 10s \
-  -buffer 4096
+kankans.exe -bind 0.0.0.0 -port 8080 -proxy 8081 -key your-secret-key -max-conn 100 -timeout 30s -heartbeat 10s -buffer 4096
 ```
 
 ### 客户端（内网）
 
 ```bash
-# 基础用法 - 暴露本地Web服务
+# 基础用法 - 暴露本地Web服务（TCP模式）
 kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 80 -key your-secret-key
 
+# UDP模式 - 暴露本地UDP服务
+kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 53 -key your-secret-key -udp
+
 # 高级配置
-kankanc.exe \
-  -server your-server-ip \
-  -sport 8080 \
-  -local 127.0.0.1 \
-  -lport 80 \
-  -key your-secret-key
+kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 80 -key your-secret-key -max-retry 5 -retry-delay 5s -buffer 8192
 ```
+
+```powershell
+kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 80 -key your-secret-key
+```
+
+## 工作原理
+
+```mermaid
+sequenceDiagram
+    participant C as 本地服务
+    participant KC as KankanC
+    participant KS as KankanS
+    participant U as 用户
+
+    C->>KC: 本地服务
+    KC->>KS: 加密连接
+    Note over KC,KS: 会话建立<br/>与心跳维持
+    U->>KS: 访问请求
+    KS->>KC: 转发请求
+    KC->>C: 转发至本地服务
+    C->>KC: 服务响应
+    KC->>KS: 加密响应
+    KS->>U: 最终响应
+
+    Note over KC,KS: 持续连接<br/>监控
+```
+
+上图展示了基本的工作流程：
+1. KankanC 与 KankanS 建立加密连接
+2. KankanC 通过心跳机制维持连接
+3. 当用户访问 KankanS 时，请求被转发到 KankanC
+4. KankanC 将请求转发到本地服务并返回响应
+5. KankanC 和 KankanS 之间的所有数据传输都是加密的
 
 ## 命令行选项
 
@@ -56,8 +79,12 @@ kankanc.exe \
 - `-idle-timeout`：空闲连接超时（默认：300s）
 
 ### 客户端选项
-- `-server`：服务器地址（默认："127.0.0.1"）
-- `-sport`：服务器端口（默认：8080）
+- `-server`：远程服务器地址（必需）
+- `-sport`：远程服务器端口（默认：8080）
 - `-local`：本地服务地址（默认："127.0.0.1"）
-- `-lport`：本地服务端口（默认：80）
+- `-lport`：本地服务端口（必需）
 - `-key`：加密密钥（必需）
+- `-udp`：启用UDP模式用于UDP服务转发
+- `-max-retry`：最大重连尝试次数（默认：3）
+- `-retry-delay`：重连尝试间隔时间（默认：3s）
+- `-buffer`：缓冲区大小（单位：字节，默认：4096）

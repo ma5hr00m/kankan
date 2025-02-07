@@ -27,7 +27,7 @@ foreach ($platform in $platforms) {
     $null = New-Item -ItemType Directory -Force -Path (Join-Path $outputDir $platform)
 }
 
-function Build-Binary {
+function New-Binary {
     param (
         [string]$os,
         [string]$arch,
@@ -58,8 +58,8 @@ $builtFiles = @()
 
 foreach ($platform in $platforms) {
     $os, $arch = $platform.Split("_")
-    $builtFiles += Build-Binary -os $os -arch $arch -component "kankans"
-    $builtFiles += Build-Binary -os $os -arch $arch -component "kankanc"
+    $builtFiles += New-Binary -os $os -arch $arch -component "kankans"
+    $builtFiles += New-Binary -os $os -arch $arch -component "kankanc"
 }
 
 Write-ColorOutput Green "`nBuild completed successfully at $buildTime"
