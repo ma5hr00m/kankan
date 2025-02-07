@@ -107,7 +107,7 @@ func (c *Client) monitorConnection() {
 			return
 		}
 
-		_, err := c.conn.Write([]byte{0}) // heartbeat
+		_, err := c.conn.Write([]byte{0})
 		if err != nil {
 			c.handleDisconnect()
 		}

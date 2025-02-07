@@ -30,6 +30,93 @@ kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 53 -key y
 kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 80 -key your-secret-key -max-retry 5 -retry-delay 5s -buffer 8192
 ```
 
+## Features
+
+### Security
+- AES-256 encryption with dynamic nonce for data protection
+- SHA-256 based key derivation for secure key management
+- Message authentication to prevent tampering
+> Path: `/pkg/crypto/crypto.go`
+```go
+func NewCrypto(key string) (*Crypto, error) {
+    h := sha256.New()
+    h.Write([]byte(key))
+    keyBytes := h.Sum(nil)
+    block, err := aes.NewCipher(keyBytes)
+    // ...
+}
+```
+
+### Traffic Obfuscation
+- HTTP/WebSocket protocol simulation
+- Dynamic padding and jitter
+- Common browser User-Agent rotation
+- TLS-like traffic patterns
+> Path: `/pkg/protocol/protocol.go`
+```go
+type ObfuscationConfig struct {
+    EnableHTTP    bool
+    EnableWSS     bool
+    PaddingRange  [2]int
+    JitterRange   time.Duration
+    FragmentSize  int
+    EnableTLSLike bool
+    DynamicPort   bool
+    PortRange     [2]int
+}
+```
+
+### Performance
+- Worker pool for efficient connection handling
+- Buffer pool for memory optimization
+- LZ4 compression for data transfer
+> Path: `/kankans/main.go`
+```go
+type Server struct {
+    workerPool  *WorkerPool
+    bufferPool  sync.Pool
+    metrics     *Metrics
+    // ...
+}
+
+bufPool: sync.Pool{
+    New: func() interface{} {
+        return make([]byte, 0, 4096)
+    },
+}
+```
+
+### Protocol Support
+- TCP proxy with automatic reconnection
+- UDP proxy with session management
+- Dynamic port allocation
+> Path: `/kankans/main.go`
+```go
+type UDPSession struct {
+    clientAddr *net.UDPAddr
+    localConn  *net.UDPConn
+    lastSeen   time.Time
+    crypto     *crypto.Crypto
+}
+```
+
+### Monitoring & Management
+- Real-time metrics collection
+- Connection and traffic statistics
+- Automatic cleanup of inactive sessions
+> Path: `/kankans/main.go`
+```go
+type Metrics struct {
+    activeConnections int32
+    totalConnections  uint64
+    totalBytes        uint64
+    totalPackets      uint64
+    lastMinuteBytes   uint64
+    lastMinutePackets uint64
+    // ...
+}
+```
+
 ## How It Works
 
 ```mermaid

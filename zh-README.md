@@ -34,6 +34,93 @@ kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 80 -key y
 kankanc.exe -server your-server-ip -sport 8080 -local 127.0.0.1 -lport 80 -key your-secret-key
 ```
 
+## 功能特色
+
+### 安全性
+- 使用 AES-256 加密和动态随机数保护数据
+- 基于 SHA-256 的密钥派生确保密钥安全
+- 消息认证防止篡改
+> 路径：`/pkg/crypto/crypto.go`
+```go
+func NewCrypto(key string) (*Crypto, error) {
+    h := sha256.New()
+    h.Write([]byte(key))
+    keyBytes := h.Sum(nil)
+    block, err := aes.NewCipher(keyBytes)
+    // ...
+}
+```
+
+### 流量混淆
+- HTTP/WebSocket 协议模拟
+- 动态填充和抖动
+- 常见浏览器 User-Agent 轮换
+- 类 TLS 流量特征
+> 路径：`/pkg/protocol/protocol.go`
+```go
+type ObfuscationConfig struct {
+    EnableHTTP    bool
+    EnableWSS     bool
+    PaddingRange  [2]int
+    JitterRange   time.Duration
+    FragmentSize  int
+    EnableTLSLike bool
+    DynamicPort   bool
+    PortRange     [2]int
+}
+```
+
+### 性能优化
+- 工作池高效处理连接
+- 缓冲池优化内存使用
+- LZ4 数据压缩传输
+> 路径：`/kankans/main.go`
+```go
+type Server struct {
+    workerPool  *WorkerPool
+    bufferPool  sync.Pool
+    metrics     *Metrics
+    // ...
+}
+
+bufPool: sync.Pool{
+    New: func() interface{} {
+        return make([]byte, 0, 4096)
+    },
+}
+```
+
+### 协议支持
+- TCP 代理和自动重连
+- UDP 代理及会话管理
+- 动态端口分配
+> 路径：`/kankans/main.go`
+```go
+type UDPSession struct {
+    clientAddr *net.UDPAddr
+    localConn  *net.UDPConn
+    lastSeen   time.Time
+    crypto     *crypto.Crypto
+}
+```
+
+### 监控管理
+- 实时指标收集
+- 连接和流量统计
+- 自动清理非活动会话
+> 路径：`/kankans/main.go`
+```go
+type Metrics struct {
+    activeConnections int32
+    totalConnections  uint64
+    totalBytes        uint64
+    totalPackets      uint64
+    lastMinuteBytes   uint64
+    lastMinutePackets uint64
+    // ...
+}
+```
+
 ## 工作原理
 
 ```mermaid

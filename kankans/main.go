@@ -511,7 +511,7 @@ func (s *Server) handleUDPProxyRequest(clientAddr string, client *Client) error 
 		clientAddr: remoteAddr,
 		localConn:  localConn,
 		lastSeen:   time.Now(),
-		crypto:     client.crypto, // 使用客户端的加密实例
+		crypto:     client.crypto,
 	}
 
 	s.mu.Lock()
@@ -535,7 +535,6 @@ func (s *Server) handleUDPSession(session *UDPSession) {
 
 		session.lastSeen = time.Now()
 
-		// 加密发送到客户端的数据
 		encrypted, err := session.crypto.Encrypt(buffer[:n])
 		if err != nil {
 			s.metrics.recordError()
